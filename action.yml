@@ -1,0 +1,203 @@
+name: 'Node.js Builder & Deployer'
+description: 'Build, test, audit, and deploy Node.js applications to Kubernetes with Docker multi-platform support'
+author: 'cfindlayisme'
+
+inputs:
+  node-version:
+    description: 'Node.js version to use'
+    required: false
+    default: '22'
+  
+  vault-addr:
+    description: 'Vault server address'
+    required: true
+  
+  vault-role-id:
+    description: 'Vault AppRole role ID'
+    required: true
+  
+  vault-secret-id:
+    description: 'Vault AppRole secret ID'
+    required: true
+  
+  vault-kubeconfig-path:
+    description: 'Vault path to kubeconfig secret'
+    required: true
+    default: 'kv/data/pipeline/k3s'
+  
+  github-token:
+    description: 'GitHub token for container registry'
+    required: true
+  
+  repository:
+    description: 'GitHub repository (owner/name)'
+    required: true
+  
+  ref:
+    description: 'Git reference being built'
+    required: true
+  
+  staging-enabled:
+    description: 'Enable staging deployment'
+    required: false
+    default: 'true'
+  
+  production-enabled:
+    description: 'Enable production deployment'
+    required: false
+    default: 'true'
+  
+  staging-namespace:
+    description: 'Kubernetes namespace for staging'
+    required: false
+    default: 'staging'
+  
+  production-namespace:
+    description: 'Kubernetes namespace for production'
+    required: false
+    default: 'production'
+  
+  deployment-name:
+    description: 'Kubernetes deployment name'
+    required: true
+  
+  docker-platforms:
+    description: 'Docker platforms to build for'
+    required: false
+    default: 'linux/amd64,linux/arm64'
+  
+  dockerfile-path:
+    description: 'Path to Dockerfile'
+    required: false
+    default: './Dockerfile'
+  
+  docker-context:
+    description: 'Docker build context'
+    required: false
+    default: '.'
+  
+  audit-level:
+    description: 'npm audit severity level (low, moderate, high, critical)'
+    required: false
+    default: 'high'
+  
+  run-tests:
+    description: 'Whether to run npm test'
+    required: false
+    default: 'true'
+
+outputs:
+  audit-result:
+    description: 'Security audit result'
+    value: ${{ steps.audit.outcome }}
+  
+  test-result:
+    description: 'Unit test result'
+    value: ${{ steps.test.outcome }}
+  
+  build-result:
+    description: 'Docker build result'
+    value: ${{ steps.build.outcome }}
+  
+  deploy-result:
+    description: 'Deployment result'
+    value: ${{ steps.deploy.outcome }}
+
+runs:
+  using: 'composite'
+  steps:
+    # Checkout code
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    # Set up Node.js
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+    
+    # Install dependencies
+    - name: Install dependencies
+      run: npm install
+      shell: bash
+    
+    # Security Audit
+    - name: Run security audit
+      id: audit
+      run: npm audit --audit-level=${{ inputs.audit-level }}
+      shell: bash
+    
+    # Unit Testing
+    - name: Run unit tests
+      id: test
+      if: inputs.run-tests == 'true'
+      run: npm test
+      shell: bash
+    
+    # Build and Push Docker Images
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+    
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.github-token }}
+    
+    - name: Build and push staging tag
+      id: build
+      if: inputs.staging-enabled == 'true'
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.docker-context }}
+        file: ${{ inputs.dockerfile-path }}
+        platforms: ${{ inputs.docker-platforms }}
+        push: true
+        tags: ghcr.io/${{ inputs.repository }}:staging
+    
+    - name: Build and push latest tag
+      if: inputs.production-enabled == 'true' && inputs.ref == 'refs/heads/main'
+      uses: docker/build-push-action@v6
+      with:
+        context: ${{ inputs.docker-context }}
+        file: ${{ inputs.dockerfile-path }}
+        platforms: ${{ inputs.docker-platforms }}
+        push: true
+        tags: ghcr.io/${{ inputs.repository }}:latest
+    
+    # Deploy to Kubernetes
+    - name: Retrieve kubeconfig from Vault
+      id: import-secrets
+      uses: hashicorp/vault-action@v3.4.0
+      with:
+        url: ${{ inputs.vault-addr }}
+        method: approle
+        roleId: ${{ inputs.vault-role-id }}
+        secretId: ${{ inputs.vault-secret-id }}
+        secrets: ${{ inputs.vault-kubeconfig-path }} kubeconfig
+        exportEnv: true
+    
+    - name: Save kubeconfig to file
+      run: |
+        mkdir -p $HOME/.kube
+        echo '${{ steps.import-secrets.outputs.kubeconfig }}' > $HOME/.kube/config
+        echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
+      shell: bash
+    
+    - name: Restart staging deployment
+      id: deploy
+      if: inputs.staging-enabled == 'true'
+      run: |
+        kubectl -n ${{ inputs.staging-namespace }} rollout restart deployment ${{ inputs.deployment-name }}
+      shell: bash
+    
+    - name: Restart production deployment
+      if: inputs.production-enabled == 'true' && inputs.ref == 'refs/heads/main'
+      run: |
+        kubectl -n ${{ inputs.production-namespace }} rollout restart deployment ${{ inputs.deployment-name }}
+      shell: bash
+
+branding:
+  icon: 'package'
+  color: 'green'
